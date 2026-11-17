@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cuộc Đua Giải Mật Mã - Realtime</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, updateDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase Configuration injected via environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'cuocdua-default-app';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        
+        let app, db, auth;
+        if (Object.keys(firebaseConfig).length > 0) {
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+        }
+
+        const TOTAL_CHALLENGES = 2;
+        let globalGameState = null;
+        let currentRole = 'teacher'; 
+        let studentTeam = null; 
+        let currentAttempt = { level: null };
+        let renderedNumTeams = 0; // Tránh render lại DOM nếu số lượng không đổi
+
+        // Bảng màu cho các đội (lặp lại nếu số đội lớn hơn 6)
+        const THEMES = [
+            { bg: 'bg-[#f15b5b]', border: 'border-[#f15b5b]', text: 'text-[#f15b5b]', light: 'bg-[#ffeded]', icon: 'fa-fire', iconColor: 'text-yellow-300' },
+            { bg: 'bg-[#f29924]', border: 'border-[#f29924]', text: 'text-[#f29924]', light: 'bg-[#fff4e6]', icon: 'fa-bolt', iconColor: 'text-yellow-100' },
+            { bg: 'bg-[#a2cc14]', border: 'border-[#a2cc14]', text: 'text-[#a2cc14]', light: 'bg-[#f5fae6]', icon: 'fa-sun', iconColor: 'text-yellow-200' },
+            { bg: 'bg-[#3b82f6]', border: 'border-[#3b82f6]', text: 'text-[#3b82f6]', light: 'bg-[#eff6ff]', icon: 'fa-water', iconColor: 'text-cyan-200' },
+            { bg: 'bg-[#a855f7]', border: 'border-[#a855f7]', text: 'text-[#a855f7]', light: 'bg-[#faf5ff]', icon: 'fa-star', iconColor: 'text-pink-200' },
+            { bg: 'bg-[#ec4899]', border: 'border-[#ec4899]', text: 'text-[#ec4899]', light: 'bg-[#fdf2f8]', icon: 'fa-heart', iconColor: 'text-rose-200' }
+        ];
+
+        const defaultState = {
+            numTeams: 3,
+            teamsConfig: {
+                1: { name: 'DẺO PLASTIC', passwords: ['KHÁI NIỆM', 'PHÂN BIỆT'], keywords: ['RÁC THẢI', 'NHỰA'] },
+                2: { name: 'COMPOSITE HỢP LỰC', passwords: ['KHÁI NIỆM', 'PHÂN BIỆT'], keywords: ['TÁI', 'CHẾ'] },
+                3: { name: 'SILK BỀN BỈ', passwords: ['KHÁI NIỆM', 'PHÂN BIỆT'], keywords: ['NHỰA', 'SINH HỌC'] }
+            },
+            teamsProgress: {
+                1: 0,
+                2: 0,
+                3: 0
+            },
+            teamsLastUpdated: {
+                1: 0,
+                2: 0,
+                3: 0
+            }
+        };
+
+        // --- Core UI Functions ---
+        function showToast(message, type = 'error') {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = `fixed top-4 left-1/2 transform -translate-x-1/2 px-6 py-3 rounded-full shadow-lg transition-opacity duration-300 pointer-events-none z-[100] font-semibold text-white ${type === 'error' ? 'bg-red-500' : 'bg-green-500'}`;
+            toast.style.opacity = '1';
+            setTimeout(() => { toast.style.opacity = '0'; }, 3000);
+        }
+
+        // --- Audio & TTS Effects ---
+        let audioCtx;
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+
+        function playSound(type) {
+            initAudio();
+            const osc = audioCtx.createOscillator();
+            const gainNode = audioCtx.createGain();
+            osc.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+            
+            if (type === 'correct') {
+                osc.type = 'triangle';
+                // Tạo hợp âm chiến thắng
+                osc.frequency.setValueAtTime(523.25, audioCtx.currentTime); // C5
+                osc.frequency.setValueAtTime(659.25, audioCtx.currentTime + 0.1); // E5
+                osc.frequency.setValueAtTime(783.99, audioCtx.currentTime + 0.2); // G5
+                osc.frequency.setValueAtTime(1046.50, audioCtx.currentTime + 0.3); // C6
+                gainNode.gain.setValueAtTime(0.15, audioCtx.currentTime);
+                gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+                osc.start();
+                osc.stop(audioCtx.currentTime + 0.5);
+            } else {
+                osc.type = 'sawtooth';
+                // Tạo âm thanh sai (buzz)
+                osc.frequency.setValueAtTime(200, audioCtx.currentTime); 
+                osc.frequency.linearRampToValueAtTime(100, audioCtx.currentTime + 0.3);
+                gainNode.gain.setValueAtTime(0.15, audioCtx.currentTime);
+                gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+                osc.start();
+                osc.stop(audioCtx.currentTime + 0.3);
+            }
+        }
+
+        function speak(text) {
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel(); // Dừng câu trước đó nếu đang đọc
+                const msg = new SpeechSynthesisUtterance(text);
+                msg.lang = 'vi-VN'; // Giọng tiếng Việt
+                msg.rate = 1.1;
+                window.speechSynthesis.speak(msg);
+            }
+        }
+
+        function switchTab(role) {
+            currentRole = role;
+            document.querySelectorAll('.view-section').forEach(el => el.classList.add('hidden'));
+            document.getElementById(`view-${role}`).classList.remove('hidden');
+            
+            // Tab styling
+            document.querySelectorAll('.nav-tab').forEach(el => {
+                el.classList.remove('bg-blue-600', 'text-white', 'shadow-md');
+                el.classList.add('text-gray-400', 'hover:bg-gray-800');
+            });
+            const activeTab = document.getElementById(`tab-${role}`);
+            activeTab.classList.remove('text-gray-400', 'hover:bg-gray-800');
+            activeTab.classList.add('bg-blue-600', 'text-white', 'shadow-md');
+
+            if (role === 'admin' && globalGameState) {
+                document.getElementById('admin-num-teams').value = globalGameState.numTeams;
+                buildAdminStructure(globalGameState.numTeams);
+                populateAdminForm();
+            }
+            if (role === 'student' && !studentTeam) {
+                document.getElementById('student-select-team').classList.remove('hidden');
+                document.getElementById('student-workspace').classList.add('hidden');
+            }
+            
+            updateUI(); // Đảm bảo đồng bộ ngay lập tức khi chuyển qua lại giữa các tab
+        }
+        window.switchTab = switchTab;
+
+        function checkAndRebuildDOM() {
+            if (!globalGameState) return;
+            if (renderedNumTeams !== globalGameState.numTeams) {
+                renderedNumTeams = globalGameState.numTeams;
+                buildTeacherStructure(renderedNumTeams);
+                buildStudentSelectionStructure(renderedNumTeams);
+            }
+        }
+
+        function buildTeacherStructure(num) {
+            const container = document.getElementById('teacher-teams');
+            container.innerHTML = '';
+            // Sử dụng CSS Grid nội tuyến để đảm bảo chia đều các cột trên 1 hàng ngang
+            container.style.display = 'grid';
+            container.style.gridTemplateColumns = `repeat(${num}, minmax(0, 1fr))`;
+            container.style.gap = '1rem';
+            container.style.width = '100%';
+
+            for(let i=1; i<=num; i++) {
+                const t = THEMES[(i-1) % THEMES.length];
+                container.innerHTML += `
+                    <div class="bg-white rounded-2xl border-[4px] ${t.border} p-3 shadow-xl flex flex-col h-full">
+                        <div class="${t.bg} rounded-xl p-3 text-white flex flex-col items-center shadow-inner relative">
+                            <div class="absolute right-2 top-2 font-bold text-[10px] tracking-wider animate-pulse"><i class="fa-solid fa-circle text-green-300 text-[8px] align-middle mr-1"></i>LIVE</div>
+                            <h2 id="teacher-team-name-${i}" class="text-xl font-bold mb-1 flex items-center gap-2 text-center uppercase"><i class="fa-solid ${t.icon} ${t.iconColor}"></i> <span id="t-name-text-${i}" class="whitespace-nowrap">NHÓM ${i}</span></h2>
+                            <p id="teacher-team-${i}-progress" class="text-xs font-medium bg-black/20 px-2 py-1 rounded-full mt-1">0/${TOTAL_CHALLENGES} thử thách</p>
+                        </div>
+                        <div class="flex flex-row justify-center gap-4 mt-8 px-4 w-full">
+                            <div id="teacher-t${i}-l1" class="flex-1 h-32 md:h-40 rounded-2xl ${t.light} flex flex-col items-center justify-center shadow-inner transition-all duration-500"><i class="fa-solid fa-lock text-5xl md:text-6xl text-gray-400"></i><span class="font-bold opacity-70 mt-4 text-lg md:text-xl">Thử thách 1</span></div>
+                            <div id="teacher-t${i}-l2" class="flex-1 h-32 md:h-40 rounded-2xl ${t.light} flex flex-col items-center justify-center shadow-inner transition-all duration-500"><i class="fa-solid fa-lock text-5xl md:text-6xl text-gray-400"></i><span class="font-bold opacity-70 mt-4 text-lg md:text-xl">Thử thách 2</span></div>
+                        </div>
+                        <div class="flex flex-row justify-center gap-2 mt-auto mb-2 px-2 pt-6 w-full flex-nowrap">
+                            <div id="teacher-t${i}-f1" class="flex-1 px-3 min-h-[3.5rem] rounded-lg border-2 ${t.border} flex items-center justify-center text-lg font-bold ${t.text} bg-gray-50 transition-colors whitespace-nowrap overflow-hidden text-ellipsis">?</div>
+                            <div id="teacher-t${i}-f2" class="flex-1 px-3 min-h-[3.5rem] rounded-lg border-2 ${t.border} flex items-center justify-center text-lg font-bold ${t.text} bg-gray-50 transition-colors whitespace-nowrap overflow-hidden text-ellipsis">?</div>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        function buildStudentSelectionStructure(num) {
+            const container = document.getElementById('student-team-buttons');
+            container.innerHTML = '';
+            container.className = 'grid gap-4 md:gap-6 w-full';
+            container.style.gridTemplateColumns = `repeat(${num}, minmax(0, 1fr))`;
+            
+            for(let i=1; i<=num; i++) {
+                const t = THEMES[(i-1) % THEMES.length];
+                const teamName = globalGameState.teamsConfig[i]?.name || `NHÓM ${i}`;
+                container.innerHTML += `
+                    <button onclick="joinTeam(${i})" class="w-full ${t.bg} hover:brightness-110 text-white p-4 md:p-6 rounded-2xl font-bold text-lg md:text-xl shadow-xl transition-transform hover:-translate-y-2 border-b-4 border-black/20 flex flex-col items-center justify-center whitespace-nowrap">
+                        <i class="fa-solid ${t.icon} block text-3xl md:text-4xl mb-3 ${t.iconColor}"></i> <span id="student-select-name-${i}" class="uppercase">${teamName}</span>
+                    </button>
+                `;
+            }
+        }
+
+        function buildAdminStructure(num) {
+            const container = document.getElementById('admin-teams-container');
+            container.innerHTML = '';
+            for(let i=1; i<=num; i++) {
+                container.innerHTML += `
+                    <div class="bg-[#151936] p-6 rounded-2xl border border-gray-700/50">
+                        <h3 class="text-lg font-bold text-orange-400 mb-4 border-l-4 border-orange-400 pl-3">Cấu hình Đội ${i}</h3>
+                        <div class="space-y-4">
+                            <div>
+                                <label class="block text-sm font-semibold text-gray-300 mb-1">Tên đội:</label>
+                                <input type="text" id="cfg-name-${i}" placeholder="VD: Nhóm 1 - 5A4" class="w-full bg-[#0f1229] border border-gray-600 rounded-xl px-4 py-2 text-white focus:outline-none focus:border-blue-500 transition-colors">
+                            </div>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-semibold text-gray-400 mb-1">Mật mã Thử thách 1:</label>
+                                    <input type="text" id="cfg-pass-1-${i}" class="w-full bg-[#0f1229] border border-gray-600 rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-blue-500">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-semibold text-gray-400 mb-1">Từ khóa Thử thách 1:</label>
+                                    <input type="text" id="cfg-key-1-${i}" class="w-full bg-[#0f1229] border border-gray-600 rounded-xl px-3 py-2 text-white uppercase text-center focus:outline-none focus:border-blue-500">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-semibold text-gray-400 mb-1">Mật mã Thử thách 2:</label>
+                                    <input type="text" id="cfg-pass-2-${i}" class="w-full bg-[#0f1229] border border-gray-600 rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-blue-500">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-semibold text-gray-400 mb-1">Từ khóa Thử thách 2:</label>
+                                    <input type="text" id="cfg-key-2-${i}" class="w-full bg-[#0f1229] border border-gray-600 rounded-xl px-3 py-2 text-white uppercase text-center focus:outline-none focus:border-blue-500">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        window.changeAdminNumTeams = function() {
+            const num = parseInt(document.getElementById('admin-num-teams').value);
+            if(num >= 1 && num <= 10) buildAdminStructure(num);
+        }
+
+        function updateUI() {
+            if (!globalGameState) return;
+            checkAndRebuildDOM();
+
+            // 1. Update Teacher View
+            for(let team = 1; team <= globalGameState.numTeams; team++) {
+                const config = globalGameState.teamsConfig[team];
+                const progress = globalGameState.teamsProgress[team] || 0;
+                
+                const nameTextEl = document.getElementById(`t-name-text-${team}`);
+                if(nameTextEl && config) nameTextEl.textContent = config.name;
+                
+                const progEl = document.getElementById(`teacher-team-${team}-progress`);
+                if(progEl) progEl.textContent = `${progress}/${TOTAL_CHALLENGES} thử thách`;
+                
+                for(let level = 1; level <= TOTAL_CHALLENGES; level++) {
+                    const btn = document.getElementById(`teacher-t${team}-l${level}`);
+                    const frag = document.getElementById(`teacher-t${team}-f${level}`);
+                    if(!btn || !frag) continue;
+                    
+                    if (progress >= level) {
+                        btn.classList.add('unlocked-card', 'bg-white');
+                        btn.innerHTML = `<i class="fa-solid fa-lock-open text-5xl md:text-6xl text-orange-400"></i><span class="font-bold text-gray-800 mt-4 text-lg md:text-xl">Thử thách ${level}</span>`;
+                        frag.textContent = config.keywords[level-1] || '';
+                        frag.classList.add('bg-white');
+                    } else {
+                        btn.classList.remove('unlocked-card', 'bg-white');
+                        btn.innerHTML = `<i class="fa-solid fa-lock text-5xl md:text-6xl text-gray-400 opacity-80"></i><span class="font-bold opacity-70 mt-4 text-lg md:text-xl">Thử thách ${level}</span>`;
+                        frag.textContent = '?';
+                        frag.classList.remove('bg-white');
+                    }
+                }
+            }
+
+            // 2. Update Student Workspace
+            // Nếu admin giảm số đội và học sinh đang ở đội không còn tồn tại -> Thoát ra màn hình chọn đội
+            if (studentTeam && studentTeam > globalGameState.numTeams) {
+                leaveTeam();
+            }
+
+            if (!studentTeam) {
+                // Cập nhật tên trên nút chọn đội ngoài màn hình chờ
+                for(let team = 1; team <= globalGameState.numTeams; team++) {
+                   const selName = document.getElementById(`student-select-name-${team}`);
+                   if(selName && globalGameState.teamsConfig[team]) {
+                       selName.textContent = globalGameState.teamsConfig[team].name;
+                   }
+                }
+            } else {
+                // Cập nhật thông tin trong không gian làm việc của đội
+                const progress = globalGameState.teamsProgress[studentTeam] || 0;
+                const config = globalGameState.teamsConfig[studentTeam];
+                
+                const progressText = document.getElementById('student-progress-text');
+                const titleText = document.getElementById('student-team-title');
+                
+                if (progressText) progressText.textContent = `${progress}/${TOTAL_CHALLENGES} thử thách`;
+                if (titleText) titleText.textContent = config?.name || `NHÓM ${studentTeam}`;
+
+                for(let level = 1; level <= TOTAL_CHALLENGES; level++) {
+                    const btn = document.getElementById(`student-l${level}`);
+                    const frag = document.getElementById(`student-f${level}`);
+                    if(!btn || !frag) continue;
+                    
+                    if (progress >= level) {
+                        btn.classList.add('unlocked-card', 'bg-white');
+                        btn.innerHTML = `<i class="fa-solid fa-lock-open text-5xl md:text-6xl text-orange-400"></i><span class="font-bold text-gray-800 mt-4 text-xl">Đã mở</span>`;
+                        frag.textContent = config?.keywords[level-1] || '';
+                        frag.classList.add('bg-white');
+                    } else {
+                        btn.classList.remove('unlocked-card', 'bg-white');
+                        btn.innerHTML = `<i class="fa-solid fa-lock text-5xl md:text-6xl text-gray-400"></i><span class="font-bold opacity-70 mt-4 text-xl">Thử thách ${level}</span>`;
+                        frag.textContent = '?';
+                        frag.classList.remove('bg-white');
+                    }
+                }
+            }
+        }
+
+        // --- Firebase & Game Logic ---
+        async function initGame() {
+            if (!auth) {
+                showToast("Môi trường thiếu cấu hình Firebase.", "error");
+                return;
+            }
+
+            try {
+                const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // STRICT PATH: /artifacts/{appId}/public/data/{collectionName}
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'cuocdua', 'state');
+                const docSnap = await getDoc(docRef);
+
+                if (!docSnap.exists()) {
+                    await setDoc(docRef, defaultState);
+                }
+
+                // Listen to Realtime changes
+                onSnapshot(docRef, (snapshot) => {
+                    if (snapshot.exists()) {
+                        globalGameState = snapshot.data();
+                        document.getElementById('loading-overlay').classList.add('hidden');
+                        updateUI();
+                    }
+                }, (error) => {
+                    console.error("Lỗi đồng bộ:", error);
+                    showToast("Mất kết nối dữ liệu!", "error");
+                });
+
+            } catch (error) {
+                console.error("Lỗi khởi tạo:", error);
+                showToast("Lỗi hệ thống.", "error");
+            }
+        }
+
+        // --- Student Actions ---
+        window.joinTeam = function(team) {
+            studentTeam = team;
+            document.getElementById('student-select-team').classList.add('hidden');
+            const ws = document.getElementById('student-workspace');
+            ws.classList.remove('hidden');
+            
+            const theme = THEMES[(team-1) % THEMES.length];
+            const config = globalGameState.teamsConfig[team];
+            
+            document.getElementById('student-team-title').innerHTML = config?.name || `NHÓM ${team}`;
+            const header = document.getElementById('student-team-header');
+            header.className = `${theme.bg} rounded-[24px] p-6 text-white flex flex-col items-center justify-center relative shadow-md uppercase`;
+            
+            const card = document.getElementById('student-team-card');
+            card.className = `bg-white rounded-[32px] border-[6px] ${theme.border} p-3 shadow-2xl flex flex-col relative w-full max-w-2xl mx-auto min-h-[500px] mt-10`;
+
+            document.querySelectorAll('.student-frag').forEach(el => {
+                el.className = `student-frag flex-1 px-4 min-h-[5rem] rounded-2xl border-[3px] ${theme.border} flex items-center justify-center text-2xl md:text-3xl font-bold ${theme.text} bg-gray-50/50 shadow-sm transition-colors uppercase whitespace-nowrap`;
+            });
+
+            updateUI();
+        };
+
+        window.leaveTeam = function() {
+            studentTeam = null;
+            document.getElementById('student-workspace').classList.add('hidden');
+            document.getElementById('student-select-team').classList.remove('hidden');
+        };
+
+        window.openChallenge = function(level) {
+            if (!globalGameState || !studentTeam) return;
+            const currentProgress = globalGameState.teamsProgress[studentTeam] || 0;
+
+            if (level <= currentProgress) {
+                showToast("Thử thách này đã được giải!", "success");
+                return;
+            }
+            if (level > currentProgress + 1) {
+                showToast(`Bạn phải giải mã Thử thách ${level-1} trước!`, "error");
+                return;
+            }
+
+            currentAttempt.level = level;
+            document.getElementById('modalTitle').textContent = `MẬT MÃ THỬ THÁCH ${level}`;
+            document.getElementById('passwordInput').value = '';
+            
+            const modal = document.getElementById('passwordModal');
+            const content = document.getElementById('modalContent');
+            modal.classList.remove('hidden');
+            setTimeout(() => {
+                content.classList.remove('scale-95', 'opacity-0');
+                document.getElementById('passwordInput').focus();
+            }, 10);
+        };
+
+        window.closeModal = function() {
+            const modal = document.getElementById('passwordModal');
+            const content = document.getElementById('modalContent');
+            content.classList.add('scale-95', 'opacity-0');
+            setTimeout(() => { modal.classList.add('hidden'); }, 200);
+        };
+
+        window.submitPassword = async function() {
+            const input = document.getElementById('passwordInput').value.trim().toLowerCase();
+            const level = currentAttempt.level;
+            const config = globalGameState.teamsConfig[studentTeam];
+            const correctPass = config ? config.passwords[level-1].toLowerCase() : '';
+
+            if (input === correctPass) {
+                try {
+                    playSound('correct');
+                    speak("Chính xác! Đã mở khóa thành công.");
+                    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'cuocdua', 'state');
+                    await updateDoc(docRef, {
+                        [`teamsProgress.${studentTeam}`]: level,
+                        [`teamsLastUpdated.${studentTeam}`]: Date.now()
+                    });
+                    closeModal();
+                    showToast("🎉 CHÍNH XÁC! Đã mở khóa.", "success");
+                } catch (e) {
+                    showToast("Lỗi đồng bộ. Thử lại sau.", "error");
+                }
+            } else {
+                playSound('incorrect');
+                speak("Sai mật mã rồi, hãy thử lại!");
+                const content = document.getElementById('modalContent');
+                content.classList.add('shake');
+                document.getElementById('passwordInput').value = '';
+                setTimeout(() => content.classList.remove('shake'), 500);
+                showToast("Sai mật mã rồi!", "error");
+            }
+        };
+
+        // --- Admin Actions ---
+        function populateAdminForm() {
+            const num = parseInt(document.getElementById('admin-num-teams').value) || globalGameState.numTeams;
+            for(let i=1; i<=num; i++) {
+                const cfg = globalGameState.teamsConfig[i];
+                if(cfg) {
+                    const elName = document.getElementById(`cfg-name-${i}`);
+                    if(elName) elName.value = cfg.name || '';
+                    const elP1 = document.getElementById(`cfg-pass-1-${i}`);
+                    if(elP1) elP1.value = cfg.passwords[0] || '';
+                    const elK1 = document.getElementById(`cfg-key-1-${i}`);
+                    if(elK1) elK1.value = cfg.keywords[0] || '';
+                    const elP2 = document.getElementById(`cfg-pass-2-${i}`);
+                    if(elP2) elP2.value = cfg.passwords[1] || '';
+                    const elK2 = document.getElementById(`cfg-key-2-${i}`);
+                    if(elK2) elK2.value = cfg.keywords[1] || '';
+                }
+            }
+        }
+
+        window.saveConfig = async function() {
+            const numTeams = parseInt(document.getElementById('admin-num-teams').value) || 3;
+            const newConfig = {};
+            const newProgress = {};
+            const newLastUpdated = {};
+            
+            for(let i=1; i<=numTeams; i++) {
+                newConfig[i] = {
+                    name: document.getElementById(`cfg-name-${i}`)?.value.trim() || `NHÓM ${i}`,
+                    passwords: [
+                        document.getElementById(`cfg-pass-1-${i}`)?.value.trim() || 'KHÁI NIỆM',
+                        document.getElementById(`cfg-pass-2-${i}`)?.value.trim() || 'PHÂN BIỆT'
+                    ],
+                    keywords: [
+                        document.getElementById(`cfg-key-1-${i}`)?.value.trim() || 'A',
+                        document.getElementById(`cfg-key-2-${i}`)?.value.trim() || 'B'
+                    ]
+                };
+                newProgress[i] = globalGameState?.teamsProgress?.[i] || 0;
+                newLastUpdated[i] = globalGameState?.teamsLastUpdated?.[i] || 0;
+            }
+
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'cuocdua', 'state');
+                await updateDoc(docRef, { 
+                    numTeams: numTeams,
+                    teamsConfig: newConfig,
+                    teamsProgress: newProgress,
+                    teamsLastUpdated: newLastUpdated
+                });
+                showToast("Đã lưu cấu hình trò chơi!", "success");
+            } catch (e) {
+                console.error(e);
+                showToast("Lỗi khi lưu cấu hình.", "error");
+            }
+        };
+
+        window.resetGameProgress = async function() {
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'cuocdua', 'state');
+                const numTeams = globalGameState.numTeams || 3;
+                const resetData = {};
+                for(let i=1; i<=numTeams; i++) {
+                    resetData[`teamsProgress.${i}`] = 0;
+                    resetData[`teamsLastUpdated.${i}`] = 0;
+                }
+                
+                await updateDoc(docRef, resetData);
+                showToast("Đã đặt lại toàn bộ tiến độ!", "success");
+            } catch (e) {
+                showToast("Lỗi khi reset.", "error");
+            }
+        };
+        
+        window.showLeaderboard = function() {
+            if (!globalGameState) return;
+            const teamsList = [];
+            for (let i = 1; i <= globalGameState.numTeams; i++) {
+                const config = globalGameState.teamsConfig[i];
+                if (!config) continue;
+                
+                teamsList.push({
+                    id: i,
+                    name: config.name,
+                    progress: globalGameState.teamsProgress[i] || 0,
+                    lastUpdated: globalGameState.teamsLastUpdated?.[i] || 0,
+                    keywords: config.keywords.slice(0, globalGameState.teamsProgress[i] || 0)
+                });
+            }
+            
+            // Sắp xếp: Ưu tiên tiến độ cao (giảm dần). Nếu tiến độ bằng nhau, ưu tiên thời gian hoàn thành sớm hơn (tăng dần timestamp)
+            teamsList.sort((a, b) => {
+                if (b.progress !== a.progress) return b.progress - a.progress;
+                return a.lastUpdated - b.lastUpdated; 
+            });
+
+            const container = document.getElementById('leaderboard-list');
+            container.innerHTML = '';
+            
+            teamsList.forEach((team, index) => {
+                let rankIcon = `<span class="text-2xl font-black text-gray-500 w-8 inline-block text-center">${index + 1}</span>`;
+                let bgClass = "bg-white";
+                let borderClass = "border-gray-200";
+                
+                if (index === 0) {
+                    rankIcon = `<span class="text-4xl" title="Hạng 1">🥇</span>`;
+                    bgClass = "bg-yellow-50";
+                    borderClass = "border-yellow-400";
+                } else if (index === 1) {
+                    rankIcon = `<span class="text-4xl" title="Hạng 2">🥈</span>`;
+                    bgClass = "bg-gray-50";
+                    borderClass = "border-gray-400";
+                } else if (index === 2) {
+                    rankIcon = `<span class="text-4xl" title="Hạng 3">🥉</span>`;
+                    bgClass = "bg-orange-50";
+                    borderClass = "border-orange-400";
+                }
+
+                const keywordsHtml = team.keywords.length > 0 
+                    ? team.keywords.map(kw => `<span class="inline-block bg-blue-100 text-blue-800 text-xs md:text-sm px-2 py-1 rounded font-bold border border-blue-200">${kw}</span>`).join(' ')
+                    : '<span class="text-gray-400 text-xs md:text-sm italic">Chưa có từ khóa</span>';
+
+                container.innerHTML += `
+                    <div class="flex items-center gap-3 md:gap-4 p-3 md:p-4 ${bgClass} rounded-2xl border-2 ${borderClass} shadow-sm transition-transform hover:scale-[1.02]">
+                        <div class="flex-shrink-0 w-10 md:w-12 text-center flex items-center justify-center">${rankIcon}</div>
+                        <div class="flex-1 min-w-0">
+                            <h4 class="text-lg md:text-xl font-bold text-gray-800 uppercase whitespace-nowrap overflow-hidden text-ellipsis">${team.name}</h4>
+                            <div class="mt-1 flex flex-wrap gap-1 items-center">
+                                <span class="text-[10px] md:text-xs font-semibold text-gray-500 mr-1 uppercase">Từ khóa:</span>
+                                ${keywordsHtml}
+                            </div>
+                        </div>
+                        <div class="flex-shrink-0 text-center bg-[#1a1e43] text-white px-3 py-1.5 md:px-4 md:py-2 rounded-xl shadow-inner border border-gray-700">
+                            <span class="block text-xl md:text-2xl font-black leading-none text-orange-400">${team.progress}</span>
+                            <span class="text-[8px] md:text-[10px] uppercase font-bold text-gray-300">Hoàn thành</span>
+                        </div>
+                    </div>
+                `;
+            });
+
+            const modal = document.getElementById('leaderboardModal');
+            const content = document.getElementById('leaderboardContent');
+            modal.classList.remove('hidden');
+            setTimeout(() => content.classList.remove('scale-95', 'opacity-0'), 10);
+        };
+
+        window.closeLeaderboard = function() {
+            const modal = document.getElementById('leaderboardModal');
+            const content = document.getElementById('leaderboardContent');
+            content.classList.add('scale-95', 'opacity-0');
+            setTimeout(() => modal.classList.add('hidden'), 300);
+        };
+
+        // Init on load
+        window.onload = () => {
+            initGame();
+            document.getElementById('passwordInput').addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') submitPassword();
+            });
+        };
+    </script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #1a1e43; color: white; user-select: none; }
+        
+        .team-red { --bg: #f15b5b; --light: #ffeded; --text: #f15b5b; }
+        .team-orange { --bg: #f29924; --light: #fff4e6; --text: #f29924; }
+        .team-green { --bg: #a2cc14; --light: #f5fae6; --text: #a2cc14; }
+
+        .btn-glass { background-color: rgba(255, 255, 255, 0.1); backdrop-filter: blur(4px); transition: all 0.2s; }
+        .btn-glass:hover { background-color: rgba(255, 255, 255, 0.2); }
+        .unlocked-card { transform: scale(1.05); border: 2px solid #f29924; box-shadow: 0 4px 15px rgba(242, 153, 36, 0.3); transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+
+        .shake { animation: shake 0.5s cubic-bezier(.36,.07,.19,.97) both; }
+        @keyframes shake {
+            10%, 90% { transform: translate3d(-1px, 0, 0); }
+            20%, 80% { transform: translate3d(2px, 0, 0); }
+            30%, 50%, 70% { transform: translate3d(-4px, 0, 0); }
+            40%, 60% { transform: translate3d(4px, 0, 0); }
+        }
+
+        .custom-scrollbar::-webkit-scrollbar { width: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #0f1229; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #3b82f6; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #2563eb; }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col relative pb-20 md:pb-0 pt-16">
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="fixed inset-0 bg-[#1a1e43] z-50 flex flex-col items-center justify-center">
+        <i class="fa-solid fa-spinner fa-spin text-5xl text-blue-400 mb-4"></i>
+        <p class="text-xl font-bold animate-pulse">Đang kết nối dữ liệu máy chủ...</p>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="opacity-0"></div>
+
+    <!-- Top Navigation (For Demo/Switching Views) -->
+    <nav class="fixed top-0 left-0 right-0 bg-[#0f1229] border-b border-gray-800 px-4 py-2 z-40 flex justify-center gap-2 md:gap-4 shadow-lg">
+        <button id="tab-teacher" onclick="switchTab('teacher')" class="nav-tab bg-blue-600 text-white px-4 py-2 rounded-xl font-bold shadow-md transition-all text-sm md:text-base">
+            <i class="fa-solid fa-chalkboard-user mr-2"></i>Màn hình Giáo Viên
+        </button>
+        <button id="tab-student" onclick="switchTab('student')" class="nav-tab text-gray-400 hover:bg-gray-800 px-4 py-2 rounded-xl font-bold transition-all text-sm md:text-base">
+            <i class="fa-solid fa-tablet-screen-button mr-2"></i>Trang Học Sinh
+        </button>
+        <button id="tab-admin" onclick="switchTab('admin')" class="nav-tab text-gray-400 hover:bg-gray-800 px-4 py-2 rounded-xl font-bold transition-all text-sm md:text-base">
+            <i class="fa-solid fa-gear mr-2"></i>Cài đặt Admin
+        </button>
+    </nav>
+
+
+    <!-- ==================== VIEW: TEACHER (DASHBOARD) ==================== -->
+    <main id="view-teacher" class="view-section flex-1 p-4 md:p-8 flex flex-col">
+        <header class="flex flex-col md:flex-row justify-between items-start gap-4 mb-4 md:mb-6 w-full px-2 md:px-6">
+            <!-- Left Side: Title & Leaderboard Button -->
+            <div class="flex flex-col gap-4 flex-shrink-0">
+                <h1 class="text-3xl md:text-5xl font-black text-transparent bg-clip-text bg-gradient-to-r from-yellow-300 via-orange-400 to-red-500 uppercase tracking-widest drop-shadow-lg leading-tight text-left">
+                    CUỘC ĐUA<br>GIẢI MẬT MÃ
+                </h1>
+                <button onclick="showLeaderboard()" class="w-fit bg-gradient-to-b from-[#ffd54f] to-[#ffca28] text-[#5d4037] px-6 py-3 rounded-2xl font-black flex items-center gap-3 text-sm md:text-base shadow-xl shadow-yellow-500/20 transition-transform active:scale-95 hover:brightness-110 border-b-4 border-yellow-600">
+                    <i class="fa-solid fa-ranking-star text-red-600 text-xl"></i> CÔNG BỐ KẾT QUẢ
+                </button>
+            </div>
+
+            <!-- Right Side: Instructions -->
+            <div class="bg-[#0f1229] border border-blue-500/30 rounded-xl p-3 md:p-4 shadow-lg relative overflow-hidden flex flex-col items-start w-full md:w-[50%] lg:w-[45%]">
+                <div class="absolute top-0 left-0 w-1.5 h-full bg-blue-500"></div>
+                <h3 class="text-base font-bold text-blue-400 mb-1 flex items-center gap-2 uppercase tracking-wide">
+                    <i class="fa-solid fa-book-open"></i> Hướng dẫn trò chơi
+                </h3>
+                <p class="text-gray-300 text-xs md:text-sm leading-relaxed text-left">
+                    Có <strong>hai chặng thử thách</strong>. Các đội tiến hành hoàn thành nhiệm vụ ở mỗi chặng để thu thập mật mã. 
+                    Nhập đúng mật mã trên thiết bị học sinh sẽ mở khóa chặng sau và nhận một <strong>mảnh từ khóa</strong>. 
+                    Đội mở khóa đầy đủ và sớm nhất sẽ giành thứ hạng cao trên Bảng Xếp Hạng!
+                </p>
+            </div>
+        </header>
+
+        <div class="w-full px-2 md:px-6 flex-1 max-w-[100vw] overflow-x-auto overflow-y-hidden" id="teacher-teams">
+            <!-- Rendered by JavaScript based on numTeams -->
+        </div>
+    </main>
+
+
+    <!-- ==================== VIEW: STUDENT ==================== -->
+    <main id="view-student" class="view-section hidden flex-1 p-4 md:p-8 flex flex-col items-center justify-center bg-cover bg-center" style="background-image: radial-gradient(circle, #2a3166 0%, #1a1e43 100%);">
+        
+        <!-- Select Team Screen -->
+        <div id="student-select-team" class="text-center w-full max-w-5xl mx-auto">
+            <h2 class="text-3xl font-extrabold mb-10 text-white drop-shadow-lg">BẠN THUỘC ĐỘI NÀO? 🚀</h2>
+            <div id="student-team-buttons" class="w-full">
+                 <!-- Rendered by JavaScript based on numTeams -->
+            </div>
+        </div>
+
+        <!-- Student Workspace Screen -->
+        <div id="student-workspace" class="hidden w-full h-full flex flex-col items-center">
+            
+            <button onclick="leaveTeam()" class="absolute top-20 left-4 md:left-8 btn-glass px-4 py-2 rounded-xl text-sm font-semibold flex items-center gap-2">
+                <i class="fa-solid fa-arrow-left"></i> Đổi đội
+            </button>
+
+            <!-- Dynamic Team Card for Student -->
+            <div id="student-team-card" class="bg-white rounded-[32px] border-[6px] p-3 shadow-2xl flex flex-col relative w-full max-w-2xl mx-auto min-h-[500px] mt-10">
+                <div id="student-team-header" class="rounded-[24px] p-6 text-white flex flex-col items-center justify-center relative shadow-md">
+                    <h2 id="student-team-title" class="text-3xl font-black mb-2 flex items-center gap-3 tracking-wide whitespace-nowrap">NHÓM</h2>
+                    <p id="student-progress-text" class="text-base font-bold bg-black/20 px-4 py-1.5 rounded-full">0/2 thử thách</p>
+                </div>
+                
+                <p class="text-center text-gray-500 mt-6 font-semibold">Nhấn vào ổ khóa để nhập mật mã chặng</p>
+
+                <div class="flex flex-row justify-center gap-6 mt-8 px-4 flex-1 items-center w-full">
+                    <button id="student-l1" onclick="openChallenge(1)" class="w-40 h-48 md:w-48 md:h-56 rounded-[2rem] bg-gray-100 flex flex-col items-center justify-center shadow-inner transition-transform hover:scale-105 active:scale-95 cursor-pointer">
+                        <i class="fa-solid fa-lock text-5xl md:text-6xl text-gray-400"></i>
+                        <span class="font-bold opacity-70 mt-4 text-xl text-gray-600">Thử thách 1</span>
+                    </button>
+                    <button id="student-l2" onclick="openChallenge(2)" class="w-40 h-48 md:w-48 md:h-56 rounded-[2rem] bg-gray-100 flex flex-col items-center justify-center shadow-inner transition-transform hover:scale-105 active:scale-95 cursor-pointer">
+                        <i class="fa-solid fa-lock text-5xl md:text-6xl text-gray-400"></i>
+                        <span class="font-bold opacity-70 mt-4 text-xl text-gray-600">Thử thách 2</span>
+                    </button>
+                </div>
+
+                <div class="flex flex-row justify-center w-full flex-nowrap gap-4 mt-auto mb-6 px-4 pt-8 border-t-2 border-dashed border-gray-200">
+                    <div id="student-f1" class="student-frag flex-1 px-4 min-h-[5rem] rounded-2xl border-[3px] flex items-center justify-center text-2xl font-bold bg-gray-50 whitespace-nowrap">?</div>
+                    <div id="student-f2" class="student-frag flex-1 px-4 min-h-[5rem] rounded-2xl border-[3px] flex items-center justify-center text-2xl font-bold bg-gray-50 whitespace-nowrap">?</div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+
+    <!-- ==================== VIEW: ADMIN ==================== -->
+    <main id="view-admin" class="view-section hidden flex-1 p-4 md:p-8 flex items-center justify-center overflow-y-auto">
+        <div class="bg-[#1f244b] w-full max-w-4xl rounded-3xl border border-gray-700 p-8 shadow-2xl my-auto mt-10 md:mt-auto">
+            <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8 border-b border-gray-700 pb-6">
+                <div class="flex items-center gap-4">
+                    <div class="w-12 h-12 bg-blue-500/20 rounded-xl flex items-center justify-center text-blue-400 text-2xl">
+                        <i class="fa-solid fa-sliders"></i>
+                    </div>
+                    <div>
+                        <h2 class="text-2xl font-bold text-white">Bảng Điều Khiển Quản Trị</h2>
+                        <p class="text-gray-400 text-sm">Thiết lập cấu hình các đội</p>
+                    </div>
+                </div>
+                <div class="flex items-center gap-3 bg-[#0f1229] p-3 rounded-xl border border-gray-600">
+                    <label class="text-sm font-bold text-gray-300 whitespace-nowrap">Số lượng đội:</label>
+                    <input type="number" id="admin-num-teams" min="1" max="10" value="3" onchange="changeAdminNumTeams()" class="w-16 bg-[#151936] text-white text-center rounded-lg py-1 border border-gray-500 focus:outline-none focus:border-blue-500">
+                </div>
+            </div>
+
+            <div id="admin-teams-container" class="grid md:grid-cols-2 gap-6 mb-8 max-h-[50vh] overflow-y-auto pr-2 custom-scrollbar">
+                <!-- Rendered by JavaScript based on numTeams -->
+            </div>
+
+            <div class="flex flex-col md:flex-row gap-4 pt-6 border-t border-gray-700">
+                <button onclick="saveConfig()" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-xl shadow-lg transition-colors flex justify-center items-center gap-2">
+                    <i class="fa-solid fa-floppy-disk"></i> LƯU CẤU HÌNH & TẠO GAME
+                </button>
+                <button onclick="resetGameProgress()" class="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-4 rounded-xl shadow-lg transition-colors flex justify-center items-center gap-2">
+                    <i class="fa-solid fa-rotate-left"></i> RESET TIẾN ĐỘ CÁC ĐỘI (VỀ 0)
+                </button>
+            </div>
+        </div>
+    </main>
+
+
+    <!-- ==================== PASSWORD MODAL ==================== -->
+    <div id="passwordModal" class="fixed inset-0 bg-[#0f1229]/90 backdrop-blur-sm flex justify-center items-center hidden z-[60] transition-opacity">
+        <div class="bg-white rounded-[2rem] p-8 max-w-sm w-full mx-4 shadow-2xl transform transition-transform scale-95 opacity-0 duration-300" id="modalContent">
+            <div class="text-center">
+                <div class="w-20 h-20 bg-blue-50 rounded-[1.5rem] flex items-center justify-center mx-auto mb-6 shadow-inner border border-blue-100">
+                    <i class="fa-solid fa-key text-4xl text-blue-500"></i>
+                </div>
+                <h3 class="text-2xl font-black text-gray-800 mb-2" id="modalTitle">MẬT MÃ</h3>
+                <p class="text-gray-500 mb-8 font-medium">Nhập đáp án để mở khóa mảnh ghép</p>
+                
+                <input type="text" id="passwordInput" class="w-full text-center text-3xl tracking-widest font-black text-blue-900 bg-gray-50 border-2 border-gray-200 rounded-2xl py-4 px-4 mb-8 focus:outline-none focus:border-blue-500 focus:bg-white transition-colors" placeholder="••••" autocomplete="off">
+                
+                <div class="flex gap-4">
+                    <button onclick="closeModal()" class="flex-1 py-4 rounded-2xl font-bold text-gray-500 bg-gray-100 hover:bg-gray-200 transition-colors">HỦY</button>
+                    <button onclick="submitPassword()" class="flex-[2] py-4 rounded-2xl font-bold text-white bg-blue-600 hover:bg-blue-700 transition-colors shadow-lg shadow-blue-500/30">MỞ KHÓA 🚀</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== LEADERBOARD MODAL ==================== -->
+    <div id="leaderboardModal" class="fixed inset-0 bg-[#0f1229]/95 backdrop-blur-md flex justify-center items-center hidden z-[70] transition-opacity p-4">
+        <div class="bg-white rounded-[2rem] p-6 md:p-8 w-full max-w-3xl mx-auto shadow-[0_0_50px_-12px_rgba(0,0,0,0.5)] transform transition-transform scale-95 opacity-0 duration-300 flex flex-col max-h-[90vh]" id="leaderboardContent">
+            
+            <!-- Header -->
+            <div class="text-center mb-6 relative">
+                <div class="absolute inset-0 flex items-center justify-center opacity-[0.15] pointer-events-none">
+                    <i class="fa-solid fa-trophy text-[120px] text-yellow-500"></i>
+                </div>
+                <h2 class="text-4xl md:text-5xl font-black text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 via-orange-500 to-red-500 drop-shadow-sm uppercase tracking-wide py-2 relative z-10">BẢNG XẾP HẠNG</h2>
+                <p class="text-gray-500 font-bold uppercase tracking-widest mt-1 text-sm md:text-base relative z-10">CUỘC ĐUA GIẢI MẬT MÃ</p>
+                <button onclick="closeLeaderboard()" class="absolute top-0 right-0 w-10 h-10 bg-gray-100 text-gray-500 rounded-full hover:bg-red-100 hover:text-red-500 transition-colors flex items-center justify-center z-20">
+                    <i class="fa-solid fa-xmark text-xl"></i>
+                </button>
+            </div>
+
+            <!-- List -->
+            <div id="leaderboard-list" class="flex-1 overflow-y-auto custom-scrollbar space-y-3 p-2 relative z-10">
+                <!-- Rendered by JS -->
+            </div>
+            
+            <!-- Footer -->
+            <div class="mt-6 text-center pt-4 border-t border-gray-100 relative z-10">
+                <button onclick="closeLeaderboard()" class="bg-gray-800 text-white font-bold py-3 px-10 rounded-xl hover:bg-black transition-colors uppercase tracking-wider text-sm shadow-md">
+                    ĐÓNG XẾP HẠNG
+                </button>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
